@@ -1,0 +1,42 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Wp Db Connection</title>
+<style>body{font-family:system-ui;max-width:760px;margin:40px auto;padding:0 20px;line-height:1.65}
+h1{font-size:1.5em}h2{font-size:1.2em;margin-top:1.8em}
+pre{background:#f4f4f4;padding:14px;border-radius:8px;overflow-x:auto}
+code{background:#eee;padding:2px 6px;border-radius:4px}
+blockquote{border-left:3px solid #0a7f2e;margin:0;padding-left:14px;color:#333}
+a{color:#0a7f2e}.back{margin-top:2em}</style></head><body>
+<h1>Error establishing a database connection</h1><h2>TL;DR — fix nhanh</h2><pre><code>// wp-config.php — kiểm tra 4 dòng này trước tiên
+define(&#x27;DB_NAME&#x27;, &#x27;ten_database&#x27;);
+define(&#x27;DB_USER&#x27;, &#x27;user_db&#x27;);
+define(&#x27;DB_PASSWORD&#x27;, &#x27;mat_khau_dung&#x27;);
+define(&#x27;DB_HOST&#x27;, &#x27;localhost&#x27;);
+</code></pre><pre><code># Test kết nối MySQL thủ công
+mysql -u user_db -p -h localhost ten_database
+</code></pre><pre><code># Restart service nếu DB die
+sudo systemctl restart mysql &amp;&amp; sudo systemctl restart php-fpm
+</code></pre><h2>Nguyên nhân thật sự</h2><p>Câu &quot;Error establishing a database connection&quot; nghĩa là PHP không mở được socket tới MySQL/MariaDB. WordPress gọi <code>wpdb</code> → <code>mysqli_connect()</code> fail → <code>dead_db()</code> chạy và in ra thông báo đó. Nó <strong>không</strong> nói cho bạn biết *tại sao* fail — chỉ nói握手không thành. Nên đừng fix mù, hãy khoanh vùng: sai credentials, DB down, hay socket/host sai. 90% là một trong ba cái đó.</p><h2>4-6 nguyên nhân phổ biến (xếp theo xác suất)</h2><p>1. <strong>Sai <code>DB_PASSWORD</code> / <code>DB_USER</code></strong> — hay gặp nhất, đặc biệt sau khi migrate hoặc đổi mật khẩu hosting.</p><p>2. <strong>MySQL/MariaDB service đã chết</strong> — OOM kill, hết disk, hoặc crash.</p><p>3. <strong><code>DB_HOST</code> sai</strong> — dùng <code>localhost</code> trong khi DB nằm ở host khác, hoặc cần socket path.</p><p>4. <strong>Hết <code>max_connections</code></strong> — connection pool đầy, site nhận request mới đều fail.</p><p>5. <strong>Hết dung lượng disk</strong> — MySQL không ghi được, treo kết nối.</p><p>6. <strong>Table <code>wp_options</code> bị corrupt / file socket mất</strong> sau reboot đột ngột.</p><h2>Fix từng nguyên nhân</h2><p>### 1. Sai credentials</p><p>Đọc lại <code>wp-config.php</code>, so khớp với thông tin hosting. Test trực tiếp:</p><pre><code>mysql -u user_db -p -h localhost
+# nhập mật khẩu, nếu vào được → credentials đúng
+</code></pre><p>Nếu sai, reset quyền trong MySQL:</p><pre><code>ALTER USER &#x27;user_db&#x27;@&#x27;localhost&#x27; IDENTIFIED BY &#x27;mat_khau_moi&#x27;;
+FLUSH PRIVILEGES;
+</code></pre><p>Rồi cập nhật lại <code>wp-config.php</code> cho khớp.</p><p>### 2. MySQL service chết</p><pre><code>sudo systemctl status mysql      # hoặc mariadb
+sudo systemctl restart mysql
+sudo journalctl -u mysql -n 50 --no-pager   # xem log vì sao chết
+</code></pre><p>Nếu log báo OOM → thiếu RAM, cân nhắc tăng swap hoặc giảm <code>innodb_buffer_pool_size</code>.</p><p>### 3. <code>DB_HOST</code> sai</p><p>Nhiều môi trường managed (RDS, Cloudways...) không dùng <code>localhost</code>:</p><pre><code>// Ví dụ khi DB ở host riêng
+define(&#x27;DB_HOST&#x27;, &#x27;db.example.com:3306&#x27;);
+</code></pre><p>Nếu dùng socket:</p><pre><code>define(&#x27;DB_HOST&#x27;, &#x27;localhost:/var/run/mysqld/mysqld.sock&#x27;);
+</code></pre><p>### 4. Hết <code>max_connections</code></p><pre><code>mysql -u root -p -e &quot;SHOW STATUS LIKE &#x27;Threads_connected&#x27;;&quot;
+mysql -u root -p -e &quot;SHOW VARIABLES LIKE &#x27;max_connections&#x27;;&quot;
+</code></pre><p>Tăng tạm:</p><pre><code>SET GLOBAL max_connections = 200;
+</code></pre><p>Vĩnh viễn trong <code>my.cnf</code>:</p><pre><code>[mysqld]
+max_connections = 200
+</code></pre><p>### 5. Hết disk</p><pre><code>df -h
+du -sh /var/lib/mysql
+</code></pre><p>Dọn log cũ rồi restart:</p><pre><code>sudo journalctl --vacuum-size=200M
+sudo systemctl restart mysql
+</code></pre><p>### 6. Repair table</p><pre><code>mysqlcheck -u root -p --auto-repair --all-databases
+</code></pre><p>Hoặc bật repair của WordPress tạm thời:</p><pre><code>// wp-config.php — thêm rồi XÓA SAU KHI XONG
+define(&#x27;WP_ALLOW_REPAIR&#x27;, true);
+// truy cập /wp-admin/maint/repair.php
+</code></pre><h2>Nếu vẫn không hết: Edge cases cần soi sâu hơn</h2><li>**Proxy/cloud env vars**: `HTTP_PROXY`, `ALL_PROXY`, hoặc socket bị route qua proxy khiến `mysqli` connect nhầm chỗ. Cần `env | grep -i proxy` và test bypass.</li><li>**Multiple vhosts / nhiều `wp-config.php`**: bạn sửa một file nhưng web server đang load file khác (path `DOCUMENT_ROOT` lệch). Soi `phpinfo()` để biết file nào thực sự được nạp.</li><li>**DNS propagation sau khi đổi host DB**: record `db.example.com` chưa lan, `getent hosts db.example.com` trả IP cũ. Chờ TTL hoặc override `/etc/hosts` tạm để verify.</li><li>**Chênh lệch phiên bản client/server** hoặc `caching_sha2_password` vs `mysql_native_password` trên MySQL 8.</li><li>**Firewall/security group** chặn port 3306 từ app server.</li><p>Mấy tình huống này một AI agent có thể tự debug từng bước: chạy <code>getent</code>, <code>nc -zv host 3306</code>, so sánh <code>DOCUMENT_ROOT</code> với <code>wp-config.php</code> đang load, và lần theo log — thay vì bạn phải đoán.</p><h2>FAQ</h2><p><strong>Sửa <code>wp-config.php</code> rồi mà vẫn lỗi, tại sao?</strong></p><p>Có thể web server đang nạp một file khác (nhiều vhost), hoặc service DB vẫn chưa lên. Kiểm tra <code>phpinfo()</code> để biết file config thực tế và <code>systemctl status mysql</code>.</p><p><strong>Có nên bật <code>WP_ALLOW_REPAIR</code> lâu dài không?</strong></p><p>Không. Đó là cửa hậu, để <code>true</code> vô thời hạn là rủi ro bảo mật. Bật → repair → tắt ngay.</p><p><strong>Làm sao phân biệt lỗi credentials với DB down?</strong></p><p>Chạy <code>mysql -u user -p -h host</code>. Nếu báo &quot;Access denied&quot; → sai credentials. Nếu &quot;Can&#x27;t connect&quot; → DB/service/host có vấn đề.</p><p>---</p><p>Nếu edge case của bạn vẫn kẹt — proxy lạ, nhiều venv/vhost chồng chéo, hay DNS chưa lan — có thể dùng agent debug tự động để lần từng bước thay vì đoán mò. [Dùng thử agent tại đây](https://example.com/agent-debug).</p><p>---</p><p>*Tự debug với AI agent: [Python Fix Guides — agent giải lỗi kèm checklist tự kiểm](https://chillguys169800-ai.github.io/)*</p><p class="back"><a href="/index.html">← Back to all guides</a></p></body></html>

@@ -1,0 +1,34 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Git Push Rejected</title>
+<style>body{font-family:system-ui;max-width:760px;margin:40px auto;padding:0 20px;line-height:1.65}
+h1{font-size:1.5em}h2{font-size:1.2em;margin-top:1.8em}
+pre{background:#f4f4f4;padding:14px;border-radius:8px;overflow-x:auto}
+code{background:#eee;padding:2px 6px;border-radius:4px}
+blockquote{border-left:3px solid #0a7f2e;margin:0;padding-left:14px;color:#333}
+a{color:#0a7f2e}.back{margin-top:2em}</style></head><body>
+<h1>Error: Git push rejected: &#x27;non-fast-forward&#x27; error</h1><h2>TL;DR — fix nhanh</h2><pre><code>git pull --rebase origin &lt;branch&gt;
+# giải quyết conflict nếu có, rồi:
+git push origin &lt;branch&gt;
+</code></pre><p>Nếu commit local là rác và bạn chắc chắn muốn ghi đè: <code>git push --force-with-lease origin &lt;branch&gt;</code> (đừng dùng <code>--force</code> trần).</p><h2>Nguyên nhân thật sự</h2><p>Remote của bạn có commit mà local chưa có. Git chỉ cho push khi con trỏ branch dịch chuyển &quot;thẳng&quot; — commit mới của bạn phải nối tiếp ngay sau commit mới nhất trên remote. Khi remote đã đi trước (ai đó vừa push, hoặc bạn vừa fetch/rebase), lịch sử hai bên rẽ nhánh. Lúc này push của bạn không phải fast-forward, nên Git từ chối để tránh ghi đè mất commit của người khác.</p><p>Nói ngắn gọn: <code>non-fast-forward</code> = &quot;local của bạn đang cũ hơn remote, pull về trước đã&quot;. Đây là lỗi về thứ tự lịch sử, không phải lỗi quyền hay lỗi mạng.</p><h2>6 nguyên nhân phổ biến (xác suất giảm dần)</h2><p>1. <strong>Có người khác vừa push lên cùng branch</strong> — phổ biến nhất khi làm team.</p><p>2. <strong>Bạn commit ở máy khác / clone khác rồi quay lại máy cũ</strong> push.</p><p>3. <strong>Vừa rebase hoặc amend commit đã push</strong> làm SHA thay đổi.</p><p>4. <strong>CI/CD hoặc bot tự động commit</strong> (bump version, generate file) lên branch.</p><p>5. <strong>Đang ở nhầm branch</strong> và cố push lên branch đã đi trước.</p><p>6. <strong>Two venv / hai remote trỏ khác nhau</strong> khiến bạn tưởng đồng bộ nhưng thực ra lệch.</p><h2>Fix từng nguyên nhân</h2><p>### 1. Người khác vừa push — rebase local lên remote</p><pre><code>git fetch origin
+git rebase origin/&lt;branch&gt;
+# nếu có conflict: sửa file -&gt; git add &lt;file&gt; -&gt; git rebase --continue
+git push origin &lt;branch&gt;
+</code></pre><p>### 2. Commit từ máy khác — kéo về rồi push</p><pre><code>git pull --rebase origin &lt;branch&gt;
+git push origin &lt;branch&gt;
+</code></pre><p>### 3. Đã rebase/amend commit đã push — cần force có kiểm soát</p><pre><code>git push --force-with-lease origin &lt;branch&gt;
+</code></pre><p><code>--force-with-lease</code> chỉ ghi đè khi remote không đổi so với lần fetch cuối — an toàn hơn <code>--force</code> vì chặn việc đè commit mới của người khác.</p><p>### 4. Bot/CI tự commit — pull lại rồi push</p><pre><code>git pull --rebase origin &lt;branch&gt;
+# kiểm tra lịch sử xem bot commit gì:
+git log --oneline -10
+git push origin &lt;branch&gt;
+</code></pre><p>### 5. Nhầm branch — kiểm tra rồi mới push</p><pre><code>git branch --show-current
+git status
+# nếu sai branch:
+git switch &lt;branch-dung&gt;
+git push origin &lt;branch-dung&gt;
+</code></pre><p>### 6. Lệch remote / nhiều clone — soi remote thật</p><pre><code>git remote -v
+git fetch --all --prune
+git log --oneline --graph --all -15
+</code></pre><p>Nếu hai remote trỏ hai nơi, sửa lại cho đúng:</p><pre><code>git remote set-url origin git@github.com:org/repo.git
+git fetch origin &amp;&amp; git rebase origin/&lt;branch&gt; &amp;&amp; git push origin &lt;branch&gt;
+</code></pre><h2>Nếu vẫn không hết: Edge cases cần soi sâu hơn</h2><li>**Proxy env / corp firewall**: `http_proxy`, `https_proxy`, hoặc `no_proxy` cấu hình sai khiến `fetch` chạy nhưng nhận dữ liệu cũ, làm bạn tưởng đã đồng bộ. Soi `git config --global --get http.proxy` và biến môi trường shell.</li><li>**Multiple venvs / nhiều worktree**: bạn đang ở một git worktree hoặc virtualenv khác với chỗ commit thật, nên HEAD bạn thấy không phải HEAD bạn push. Kiểm `git worktree list` và `echo $VIRTUAL_ENV`.</li><li>**DNS propagation / mirror trỏ sai**: remote URL trỏ tới mirror hoặc host cũ chưa cập nhật, SHA trên đó lệch với origin thật. Soi `git remote -v` và phân giải host.</li><p>Ba tình huống này thường cần chạy từng lệnh chẩn đoán theo thứ tự và đọc output cẩn thận — một AI agent có thể tự debug từng bước giúp bạn: chạy fetch, so sánh graph, kiểm proxy/worktree, rồi đề xuất lệnh rebase hoặc force an toàn.</p><h2>FAQ</h2><p><strong><code>--force</code> và <code>--force-with-lease</code> khác gì nhau?</strong></p><p><code>--force</code> ghi đè vô điều kiện, có thể xóa mất commit người khác vừa push. <code>--force-with-lease</code> chỉ ghi đè nếu remote giữ nguyên so với lần fetch gần nhất, nên an toàn hơn nhiều.</p><p><strong>Rebase hay merge thì tốt hơn khi gặp lỗi này?</strong></p><p>Rebase cho lịch sử thẳng, gọn, dễ đọc; merge giữ nguyên dấu vết rẽ nhánh. Với branch cá nhân, rebase. Với branch chung đã nhiều người dùng, cân nhắc merge để tránh rewrite lịch sử chung.</p><p><strong>Làm sao tránh gặp lại lỗi này?</strong></p><p>Push thường xuyên, <code>git pull --rebase</code> trước mỗi lần push, và bật <code>git config --global pull.rebase true</code> để mặc định rebase thay vì merge.</p><p>---</p><p>Nếu edge case của bạn vẫn kẹt sau khi thử hết các bước trên, bạn có thể dùng agent debug tự động để nó chạy và phân tích từng lệnh thay bạn — [dùng thử agent tại đây](https://example.com/agent-debug).</p><p>---</p><p>*Tự debug với AI agent: [Python Fix Guides — agent giải lỗi kèm checklist tự kiểm](https://chillguys169800-ai.github.io/)*</p><p class="back"><a href="/index.html">← Back to all guides</a></p></body></html>

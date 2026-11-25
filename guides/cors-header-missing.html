@@ -1,0 +1,135 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Cors Header Missing</title>
+<style>body{font-family:system-ui;max-width:760px;margin:40px auto;padding:0 20px;line-height:1.65}
+h1{font-size:1.5em}h2{font-size:1.2em;margin-top:1.8em}
+pre{background:#f4f4f4;padding:14px;border-radius:8px;overflow-x:auto}
+code{background:#eee;padding:2px 6px;border-radius:4px}
+blockquote{border-left:3px solid #0a7f2e;margin:0;padding-left:14px;color:#333}
+a{color:#0a7f2e}.back{margin-top:2em}</style></head><body>
+<h1>Error: CORS policy: No &#x27;Access-Control-Allow-Origin&#x27; header</h1><h2>TL;DR — fix nhanh</h2><p>Giả sử lỗi đến từ API Express chưa khai báo origin được phép (nguyên nhân gặp nhiều nhất):</p><pre><code>const cors = require(&#x27;cors&#x27;);
+app.use(cors({ origin: &#x27;https://app.example.com&#x27;, methods: [&#x27;GET&#x27;,&#x27;POST&#x27;,&#x27;PUT&#x27;,&#x27;DELETE&#x27;], allowedHeaders: [&#x27;Content-Type&#x27;,&#x27;Authorization&#x27;] }));
+app.options(&#x27;*&#x27;, cors());
+</code></pre><p>Nếu dùng cookie/token trong header, đọc thêm mục 3 ở dưới — wildcard <code>*</code> sẽ không đủ.</p><h2>Nguyên nhân thật: browser chặn response, không phải request bị chặn</h2><p>CORS là cơ chế của <strong>browser</strong>, không phải của server và cũng không phải lỗi mạng. Mọi request vẫn đi tới API, server vẫn xử lý, thậm chí vẫn ghi DB — chỉ là browser từ chối đọc response vì thiếu <code>Access-Control-Allow-Origin</code> (ACAO) khớp với <code>Origin</code> của trang.</p><p><code>Origin</code> = <strong>scheme + host + port</strong>. <code>https://app.example.com</code> và <code>https://www.app.example.com</code> là hai origin khác nhau; <code>http://localhost:5173</code> và <code>http://localhost:3000</code> cũng khác nhau. Browser gửi header <code>Origin: https://app.example.com</code>, server phải trả về đúng giá trị đó (hoặc <code>*</code> cho request không có credential). Nếu không khớp, console báo đúng câu ở tiêu đề.</p><p>Điểm hay gây hiểu lầm: với request &quot;không đơn giản&quot; (<code>PUT</code>, <code>DELETE</code>, <code>Content-Type: application/json</code>, header <code>Authorization</code>...), browser gửi thêm request <code>OPTIONS</code> (preflight) <strong>trước</strong> request thật. Nếu <code>OPTIONS</code> trả 405/404 hoặc thiếu <code>Access-Control-Allow-Methods/Headers</code>, request thật không bao giờ được gửi, và lỗi vẫn hiện là &quot;No &#x27;Access-Control-Allow-Origin&#x27; header&quot; — nên bạn dễ tưởng lỗi nằm ở endpoint <code>GET</code>/<code>POST</code>.</p><p><code>curl</code> chạy được là chuyện bình thường: curl không tự gửi <code>Origin</code> và không áp same-origin policy. Muốn reproduce đúng, phải thêm <code>Origin</code> thủ công (xem mục 4).</p><h2>4–6 nguyên nhân phổ biến, xếp theo xác suất gặp</h2><p>1. <strong>Backend chưa set ACAO, hoặc set sai origin</strong> (thừa <code>/</code> cuối, nhầm <code>http</code> ↔ <code>https</code>, nhầm <code>www</code>, quên port dev). Cao nhất,尤其是 lúc mới tách frontend/back-end.</p><p>2. <strong>Preflight <code>OPTIONS</code> không được xử lý</strong> — route chỉ đăng ký <code>GET/POST</code>, middleware auth trả 401 cho <code>OPTIONS</code>, hoặc gateway trả 405.</p><p>3. **Dùng <code>*</code> cùng <code>credentials: &#x27;include&#x27;</code> / cookie / <code>Authorization</code>** — browser từ chối wildcard khi có credential; cần origin cụ thể + <code>Access-Control-Allow-Credentials: true</code>.</p><p>4. <strong>Header bị strip hoặc bị nhân đôi ở lớp trung gian</strong> — nginx/CDN thêm ACAO trong khi app cũng thêm, hoặc proxy xóa header. Browser coi hai giá trị ACAO là invalid.</p><p>5. <strong>Redirect trước khi tới API</strong> — <code>api.example.com</code> → <code>www.api.example.com</code> hoặc <code>http</code> → <code>https</code>. Browser <strong>không follow redirect cho preflight</strong>, nên <code>OPTIONS</code> bị 301/302 là fail ngay.</p><p>6. <strong>Origin động / cache sai</strong> — whitelist hardcode một origin, nhiều subdomain/dev port; response được cache mà thiếu <code>Vary: Origin</code> nên origin này nhận header của origin kia.</p><h2>Fix từng nguyên nhân</h2><p>### 1. Set đúng origin, có allowlist</p><pre><code>npm init -y &amp;&amp; npm i express
+</code></pre><pre><code>// server.js — chạy: node server.js
+const express = require(&#x27;express&#x27;);
+const app = express();
+const ALLOW = new Set([&#x27;https://app.example.com&#x27;, &#x27;http://localhost:5173&#x27;]);
+
+app.use((req, res, next) =&gt; {
+  const origin = req.headers.origin;
+  if (origin &amp;&amp; ALLOW.has(origin)) {
+    res.setHeader(&#x27;Access-Control-Allow-Origin&#x27;, origin);
+    res.setHeader(&#x27;Vary&#x27;, &#x27;Origin&#x27;);
+  }
+  next();
+});
+
+app.get(&#x27;/api/me&#x27;, (req, res) =&gt; res.json({ ok: true }));
+app.listen(3000, () =&gt; console.log(&#x27;API on :3000&#x27;));
+</code></pre><p>Giữ nguyên chuỗi: không có trailing slash, đúng scheme, đúng port. Log <code>req.headers.origin</code> một lần để thấy browser đang gửi giá trị gì.</p><p>### 2. Xử lý preflight <code>OPTIONS</code></p><pre><code>// Đặt sau middleware CORS ở mục 1
+app.options(&#x27;/api/*&#x27;, (req, res) =&gt; {
+  const origin = req.headers.origin;
+  if (origin &amp;&amp; ALLOW.has(origin)) {
+    res.setHeader(&#x27;Access-Control-Allow-Origin&#x27;, origin);
+    res.setHeader(&#x27;Access-Control-Allow-Methods&#x27;, &#x27;GET,POST,PUT,PATCH,DELETE,OPTIONS&#x27;);
+    res.setHeader(&#x27;Access-Control-Allow-Headers&#x27;, &#x27;Content-Type,Authorization,X-Request-Id&#x27;);
+    res.setHeader(&#x27;Access-Control-Max-Age&#x27;, &#x27;600&#x27;);
+    res.setHeader(&#x27;Vary&#x27;, &#x27;Origin&#x27;);
+  }
+  res.sendStatus(204); // trả 2xx, tuyệt đối không redirect
+});
+</code></pre><p>Nếu dùng nginx làm lớp trước:</p><pre><code>server {
+    listen 443 ssl;
+    server_name api.example.com;
+    ssl_certificate     /etc/ssl/certs/api.example.com.pem;
+    ssl_certificate_key /etc/ssl/private/api.example.com.key;
+
+    location /api/ {
+        if ($request_method = OPTIONS) {
+            add_header Access-Control-Allow-Origin &quot;$http_origin&quot; always;
+            add_header Access-Control-Allow-Methods &quot;GET,POST,PUT,PATCH,DELETE,OPTIONS&quot; always;
+            add_header Access-Control-Allow-Headers &quot;Content-Type,Authorization,X-Request-Id&quot; always;
+            add_header Access-Control-Max-Age 600 always;
+            return 204;
+        }
+        add_header Access-Control-Allow-Origin &quot;$http_origin&quot; always;
+        add_header Vary &quot;Origin&quot; always;
+        proxy_pass http://127.0.0.1:3000;
+        proxy_set_header Host $host;
+    }
+}
+</code></pre><p>### 3. Credential: bỏ wildcard, thêm flag</p><pre><code>// Frontend
+fetch(&#x27;https://api.example.com/api/me&#x27;, {
+  credentials: &#x27;include&#x27;,
+  headers: { &#x27;Content-Type&#x27;: &#x27;application/json&#x27; },
+});
+</code></pre><pre><code>// Backend — origin phải cụ thể, KHÔNG được là &#x27;*&#x27;
+app.use((req, res, next) =&gt; {
+  const origin = req.headers.origin;
+  if (origin &amp;&amp; ALLOW.has(origin)) {
+    res.setHeader(&#x27;Access-Control-Allow-Origin&#x27;, origin);
+    res.setHeader(&#x27;Access-Control-Allow-Credentials&#x27;, &#x27;true&#x27;);
+    res.setHeader(&#x27;Vary&#x27;, &#x27;Origin&#x27;);
+  }
+  next();
+});
+</code></pre><p>### 4. Soi header thật trước khi sửa code</p><pre><code># Response thường
+curl -i -H &#x27;Origin: https://app.example.com&#x27; https://api.example.com/api/me | head -n 30
+
+# Preflight
+curl -i -X OPTIONS \
+  -H &#x27;Origin: https://app.example.com&#x27; \
+  -H &#x27;Access-Control-Request-Method: POST&#x27; \
+  -H &#x27;Access-Control-Request-Headers: content-type,authorization&#x27; \
+  https://api.example.com/api/me
+</code></pre><p>Nếu thấy hai dòng <code>access-control-allow-origin</code>, chọn <strong>một</strong> nơi set: bỏ <code>cors()</code> trong app nếu nginx đã add, hoặc bỏ <code>add_header</code> trong nginx nếu app đã add.</p><p>### 5. Dẹt redirect và lệch origin</p><pre><code># Chỉ redirect ở HTTP; endpoint HTTPS không redirect sang www
+server {
+    listen 80;
+    server_name api.example.com;
+    return 301 https://api.example.com$request_uri;
+}
+</code></pre><pre><code>// Frontend: dùng đúng base URL như whitelist, không ghép Acid từ location.host
+const API_BASE = &#x27;https://api.example.com&#x27;;
+</code></pre><p>### 6. Whitelist động + cache đúng</p><pre><code>const isAllowed = (o = &#x27;&#x27;) =&gt;
+  /^https:\/\/[a-z0-9-]+\.example\.com$/.test(o) || o === &#x27;http://localhost:5173&#x27;;
+
+app.use((req, res, next) =&gt; {
+  const origin = req.headers.origin;
+  if (origin &amp;&amp; isAllowed(origin)) {
+    res.setHeader(&#x27;Access-Control-Allow-Origin&#x27;, origin);
+    res.setHeader(&#x27;Vary&#x27;, &#x27;Origin&#x27;);
+  }
+  next();
+});
+</code></pre><p><code>Vary: Origin</code> bắt buộc nếu có CDN/cache,否则 response cho origin A sẽ bị trả cho origin B.</p><h2>Edge cases cần soi sâu hơn</h2><li>**Proxy env (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`)**: browser không đọc biến môi trường, nhưng server-side fetch và CLI thì có. Corporate proxy có thể thêm/sửa header hoặc đẩy request qua egress khác, khiến `Origin` bạn log ở app không phải `Origin` bạn thấy trên DevTools. So sánh `env | grep -i proxy`, `curl --noproxy &#x27;*&#x27; ...`, và log `req.headers.origin` tại chính process nhận request. AI agent có thể tự lần từ env → proxy config → log server → response header, từng bước một, để chỉ ra lớp nào đổi header.</li><li>**Multiple venvs / nhiều runtime cùng máy**: bạn sửa middleware trong venv A nhưng `systemd`/PM2 đang chạy interpreter ở venv B, nên file cấu hình mới không bao giờ được load. Kiểm tra `which python`, `python -c &quot;import starlette; print(starlette.__file__)&quot;`, `pip show fastapi`, rồi đối chiếu với `ps -ef | grep uvicorn`. Agent có thể tự trace process → interpreter → package thực tế đang import và đoạn config nào đang có hiệu lực.</li><li>**DNS propagation + CDN cache**: đổi origin trong whitelist rồi vẫn lỗi ở một số region vì POP còn giữ response cũ, hoặc bản ghi mới chưa lan tới resolver. Soi `dig api.example.com`, `curl -I` lấy `Cache-Control`/`Age`, thử `?cb=&lt;value&gt;` để bypass cache, rồi purge CDN. Agent có thể tự so sánh response theo region/resolver và结论 lại là DNS, cache, hay code.</li><h2>FAQ schema</h2><pre><code>{
+  &quot;@context&quot;: &quot;https://schema.org&quot;,
+  &quot;@type&quot;: &quot;FAQPage&quot;,
+  &quot;mainEntity&quot;: [
+    {
+      &quot;@type&quot;: &quot;Question&quot;,
+      &quot;name&quot;: &quot;Tại sao curl gọi API được nhưng browser báo No &#x27;Access-Control-Allow-Origin&#x27; header?&quot;,
+      &quot;acceptedAnswer&quot;: {
+        &quot;@type&quot;: &quot;Answer&quot;,
+        &quot;text&quot;: &quot;curl không gửi header Origin và không áp same-origin policy, còn browser thì có. Để reproduce đúng, thêm -H &#x27;Origin: https://app.example.com&#x27; vào lệnh curl và kiểm tra response header.&quot;
+      }
+    },
+    {
+      &quot;@type&quot;: &quot;Question&quot;,
+      &quot;name&quot;: &quot;Có dùng Access-Control-Allow-Origin: * khi gửi cookie được không?&quot;,
+      &quot;acceptedAnswer&quot;: {
+        &quot;@type&quot;: &quot;Answer&quot;,
+        &quot;text&quot;: &quot;Không. Với credentials: &#x27;include&#x27;, cookie hoặc Authorization, browser yêu cầu origin cụ thể và Access-Control-Allow-Credentials: true. Wildcard bị từ chối.&quot;
+      }
+    },
+    {
+      &quot;@type&quot;: &quot;Question&quot;,
+      &quot;name&quot;: &quot;Có fix lỗi CORS thuần ở frontend fetch được không?&quot;,
+      &quot;acceptedAnswer&quot;: {
+        &quot;@type&quot;: &quot;Answer&quot;,
+        &quot;text&quot;: &quot;Không thể bỏ qua từ phía browser. Frontend chỉ giảm preflight (dùng request đơn giản, khớp origin) hoặc gọi cùng origin qua reverse proxy; header ACAO vẫn phải do server hoặc proxy trả về.&quot;
+      }
+    }
+  ]
+}
+</code></pre><p>Nếu edge case của bạn vẫn kẹt sau các bước trên, có thể dùng agent debug tự động để lần từ request, proxy, config tới response header: [Claude Code](https://docs.claude.com/en/docs/claude-code).</p><p>---</p><p>*Tự debug với AI agent: [Python Fix Guides — agent giải lỗi kèm checklist tự kiểm](https://chillguys169800-ai.github.io/)*</p><p class="back"><a href="/index.html">← Back to all guides</a></p></body></html>

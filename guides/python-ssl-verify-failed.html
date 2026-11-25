@@ -1,0 +1,53 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Python Ssl Verify Failed</title>
+<style>body{font-family:system-ui;max-width:760px;margin:40px auto;padding:0 20px;line-height:1.65}
+h1{font-size:1.5em}h2{font-size:1.2em;margin-top:1.8em}
+pre{background:#f4f4f4;padding:14px;border-radius:8px;overflow-x:auto}
+code{background:#eee;padding:2px 6px;border-radius:4px}
+blockquote{border-left:3px solid #0a7f2e;margin:0;padding-left:14px;color:#333}
+a{color:#0a7f2e}.back{margin-top:2em}</style></head><body>
+<h1>Error: SSL certificate verify failed — Python requests</h1><h2>TL;DR — fix nhanh</h2><pre><code>import requests
+r = requests.get(&quot;https://example.com&quot;, verify=&quot;/path/to/cacert.pem&quot;)  # chỉ định CA bundle
+r.raise_for_status()
+</code></pre><p>Nếu chỉ cần chạy tạm trong môi trường dev (KHÔNG dùng production):</p><pre><code>import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+r = requests.get(&quot;https://example.com&quot;, verify=False)
+</code></pre><p>Cách đúng lâu dài: cập nhật <code>certifi</code> (<code>pip install -U certifi</code>) rồi trỏ <code>REQUESTS_CA_BUNDLE</code> tới bundle của bạn.</p><h2>Nguyên nhân thật sự</h2><p><code>requests</code> không tự tin vào certificate của server. Khi bắt tay TLS, client phải xác thực chuỗi cert về tới một Root CA mà nó tin. <code>requests</code> dùng bundle CA đi kèm thư viện <code>certifi</code>. Lỗi <code>SSLError: certificate verify failed</code> nghĩa là quá trình xác thực chuỗi thất bại — không tìm được issuer tin cậy, cert đã hết hạn, hostname không khớp, hoặc máy bạn đang trỏ nhầm một bundle rỗng/cũ.</p><p>Đây là lỗi xác thực, không phải lỗi mạng. Kết nối TCP đã thiết lập, TLS đã bắt tay, nhưng bước verify chủ động từ chối. Điểm mấu chốt: fix đúng nghĩa là cho client một chuỗi tin cậy hợp lệ, chứ không phải tắt verify.</p><h2>4 nguyên nhân phổ biến (xếp theo xác suất)</h2><p>1. <strong><code>certifi</code> cũ / thiếu Root CA mới</strong> — máy cài từ lâu, bundle không có CA mới ký cert server.</p><p>2. <strong>Corporate proxy / TLS interception</strong> — công ty chèn cert của proxy vào luồng, cert đó không có trong bundle mặc định.</p><p>3. <strong>Self-signed hoặc internal CA</strong> — server nội bộ dùng cert tự ký hoặc CA riêng của tổ chức.</p><p>4. <strong>Hostname mismatch / cert hết hạn</strong> — CN/SAN không khớp domain, hoặc <code>notAfter</code> đã qua.</p><p>5. <strong>Env var trỏ sai bundle</strong> — <code>REQUESTS_CA_BUNDLE</code> / <code>SSL_CERT_FILE</code> trỏ tới file rỗng hoặc sai định dạng.</p><p>6. <strong>Hệ điều hành thiếu CA ở tầng OpenSSL</strong> — container slim (alpine, distroless) không có <code>ca-certificates</code>.</p><h2>Fix từng nguyên nhân</h2><p>### 1. <code>certifi</code> cũ</p><pre><code>python -m pip install --upgrade certifi requests
+python -c &quot;import certifi; print(certifi.where())&quot;
+</code></pre><pre><code>import requests
+# requests tự dùng certifi mới nhất sau khi upgrade
+r = requests.get(&quot;https://example.com&quot;, timeout=10)
+r.raise_for_status()
+print(r.status_code)
+</code></pre><p>### 2. Corporate proxy / TLS interception</p><p>Xuất cert của proxy từ Keychain (macOS) hoặc <code>/etc/ssl/certs</code> (Linux), gộp với bundle certifi:</p><pre><code># Linux: gộp CA hệ thống + certifi thành một bundle
+cat /etc/ssl/certs/ca-certificates.crt &quot;$(python -c &#x27;import certifi;print(certifi.where())&#x27;)&quot; &gt; /tmp/combined.pem
+export REQUESTS_CA_BUNDLE=/tmp/combined.pem
+</code></pre><pre><code>import os, requests
+session = requests.Session()
+session.verify = os.environ[&quot;REQUESTS_CA_BUNDLE&quot;]  # dùng bundle đã gộp
+r = session.get(&quot;https://internal-api.corp.local&quot;, timeout=10)
+r.raise_for_status()
+</code></pre><p>### 3. Self-signed / internal CA</p><pre><code>import requests
+r = requests.get(
+    &quot;https://internal.example.local/health&quot;,
+    verify=&quot;/etc/ssl/certs/internal-ca.pem&quot;,  # trỏ thẳng CA nội bộ
+    timeout=10,
+)
+r.raise_for_status()
+print(r.json())
+</code></pre><p>### 4. Hostname mismatch / cert hết hạn</p><p>Kiểm tra trước khi kết luận:</p><pre><code>openssl s_client -connect example.com:443 -servername example.com &lt;/dev/null 2&gt;/dev/null \
+  | openssl x509 -noout -subject -issuer -dates -ext subjectAltName
+</code></pre><p>Nếu SAN không chứa domain bạn gọi → đây là lỗi cấu hình server, sửa cert phía server chứ không phải client. Không có workaround an toàn ở client ngoài việc gọi đúng hostname khớp SAN.</p><p>### 5. Env var trỏ sai bundle</p><pre><code>import os, certifi, requests
+os.environ.pop(&quot;REQUESTS_CA_BUNDLE&quot;, None)   # xoá biến hỏng
+os.environ.pop(&quot;SSL_CERT_FILE&quot;, None)
+os.environ[&quot;REQUESTS_CA_BUNDLE&quot;] = certifi.where()  # set lại đúng chỗ
+r = requests.get(&quot;https://example.com&quot;, timeout=10)
+r.raise_for_status()
+</code></pre><p>### 6. OS thiếu <code>ca-certificates</code> (container)</p><pre><code>FROM python:3.12-slim
+RUN apt-get update &amp;&amp; apt-get install -y --no-install-recommends ca-certificates \
+    &amp;&amp; rm -rf /var/lib/apt/lists/*
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+CMD [&quot;python&quot;, &quot;app.py&quot;]
+</code></pre><h2>Nếu vẫn không hết: Edge cases cần soi sâu hơn</h2><li>**Proxy env + NO_PROXY đánh nhau**: biến `HTTP_PROXY`/`HTTPS_PROXY` khiến `requests` đi qua proxy nhưng cert proxy không nằm trong bundle; hoặc `NO_PROXY` loại nhầm domain nội bộ. Cần trace luồng thực tế bằng `requests` hooks và log `session.verify` tại thời điểm gọi.</li><li>**Multiple venvs / nhiều Python**: `pip` bạn upgrade nằm ở venv này, nhưng app chạy bằng venv khác hoặc system Python, nên `certifi.where()` vẫn trỏ bundle cũ. Phải xác định đúng interpreter (`sys.executable`) và bundle tương ứng.</li><li>**DNS propagation / SNI sai sau khi đổi hạ tầng**: domain mới trỏ tới LB nhưng cert trên LB chưa khớp SNI, hoặc DNS còn cache trỏ host cũ với cert khác. Cần soi từng bước: resolve IP → bắt tay TLS với đúng SNI → so cert trả về.</li><p>Ba tình huống này đều debug được theo từng bước có kiểm chứng (in cert thực tế nhận về, so issuer, kiểm tra interpreter, trace proxy). Nếu bạn muốn, một AI agent có thể tự chạy và phân tích từng bước này giúp bạn thay vì mò tay.</p><h2>FAQ</h2><p><strong>Có nên dùng <code>verify=False</code> không?</strong></p><p>Không, trừ khi debug cục bộ. Nó tắt hoàn toàn xác thực, mở cửa cho MITM. Production luôn phải verify bằng một bundle hợp lệ.</p><p><strong>Làm sao biết cert server hết hạn hay thiếu CA?</strong></p><p>Chạy <code>openssl s_client ... | openssl x509 -noout -dates -issuer</code>. Nếu <code>-dates</code> đã qua → hết hạn. Nếu issuer là CA lạ/không có trong bundle → thiếu CA.</p><p><strong><code>certifi</code> và CA của hệ điều khác nhau chỗ nào?</strong></p><p><code>certifi</code> là bundle đóng gói trong package Python, cập nhật theo pip. CA hệ điều hành do OS quản lý. <code>requests</code> mặc định ưu tiên <code>certifi</code>, nên upgrade OS không tự động cập nhật bundle mà <code>requests</code> dùng.</p><p>---</p><p>Nếu edge case của bạn vẫn kẹt sau khi thử hết các fix trên, bạn có thể dùng agent debug tự động để nó soi cert, interpreter và luồng proxy từng bước — [dùng agent tại đây](https://example.com/agent-debug).</p><p>---</p><p>*Tự debug với AI agent: [Python Fix Guides — agent giải lỗi kèm checklist tự kiểm](https://chillguys169800-ai.github.io/)*</p><p class="back"><a href="/index.html">← Back to all guides</a></p></body></html>

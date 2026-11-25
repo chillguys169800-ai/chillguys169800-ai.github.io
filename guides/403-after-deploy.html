@@ -1,0 +1,90 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>403 After Deploy</title>
+<style>body{font-family:system-ui;max-width:760px;margin:40px auto;padding:0 20px;line-height:1.65}
+h1{font-size:1.5em}h2{font-size:1.2em;margin-top:1.8em}
+pre{background:#f4f4f4;padding:14px;border-radius:8px;overflow-x:auto}
+code{background:#eee;padding:2px 6px;border-radius:4px}
+blockquote{border-left:3px solid #0a7f2e;margin:0;padding-left:14px;color:#333}
+a{color:#0a7f2e}.back{margin-top:2em}</style></head><body>
+<h1>Error: 403 Forbidden after deploying to hosting</h1><h2>TL;DR — fix nhanh</h2><pre><code>sudo chown -R www-data:www-data /var/www/app &amp;&amp; sudo chmod -R u=rwX,go=rX /var/www/app
+sudo find /var/www/app/storage /var/www/app/bootstrap/cache -type d -exec chmod 775 {} \;
+sudo systemctl reload nginx &amp;&amp; curl -I https://example.com
+</code></pre><p>Chạy trên origin (không phải qua CDN), thay <code>example.com</code> bằng domain của bạn, rồi soi <code>/var/log/nginx/error.log</code> nếu vẫn 403.</p><h2>Nguyên nhân thật</h2><p>403 khác với 404 và 500: server <strong>hiểu</strong> request nhưng <strong>từ chối authorize</strong>. Deployment vừa xong là thời điểm dễ rơi vào trạng thái này vì ba lớp thay đổi cùng lúc: file trên disk được thay (ownership, mode, symlink), process web server được reload (config mới, user chạy khác đi), và DNS/CDN bắt đầu trỏ tới bản mới.</p><p>Điểm hay bẫy nhất: nginx không cần đọc nội dung file để trả 403. Nó chỉ cần <code>stat()</code> thất bại ở <strong>bất kỳ thành phần nào của đường dẫn</strong>. Nếu <code>/var/www</code> thiếu bit <code>x</code> cho <code>www-data</code>, hoặc <code>index.php</code> thuộc <code>root:root</code> mode <code>600</code>, nginx trả 403 ngay cả khi file vẫn tồn tại. Apache thì hay trả 403 khi vào một thư mục không có <code>DirectoryIndex</code> và bị <code>Options -Indexes</code>. Nói cách khác: 403 sau deploy thường là <strong>lỗi filesystem/config của web server</strong>, không phải lỗi app logic — trừ khi app của bạn tự trả 403 từ middleware auth.</p><p>Muốn xác nhận nhanh lớp nào chặn, so sánh response từ origin và từ edge, rồi đọc error log教研 hard evidence:</p><pre><code>tail -n 50 /var/log/nginx/error.log
+curl -sS -o /dev/null -w &#x27;%{http_code} %{server} %{remote_ip}\n&#x27; https://example.com
+ps -eo user,pid,cmd | grep -E &#x27;nginx|php-fpm|apache2&#x27; | grep -v grep
+namei -l /var/www/app/public/index.php
+</code></pre><p><code>namei -l</code> là lệnh đáng giá nhất ở đây: nó liệt kê quyền từ <code>/</code> tới file, nên bạn thấy ngay đoạn nào mất <code>x</code>.</p><h2>4–6 nguyên nhân phổ biến (xếp theo xác suất gặp)</h2><p>1. <strong>Sai owner/permission sau khi upload artifact</strong> — CI chạy bằng <code>root</code>, file nén giữ uid/gid cũ, hoặc <code>rsync</code> không có <code>--chown</code>. Phổ biến nhất.</p><p>2. <strong>Document root hoặc <code>index</code> sai</strong> — symlink <code>current</code> chưa đổi, <code>root</code> trỏ tới thư mục cha, <code>try_files</code> thiếu <code>index.php</code>; nginx trả 403 thay vì 404 vì truy cập thư mục bị cấm liệt kê.</p><p>3. <strong>Rule deny trong config web server</strong> — <code>deny all</code>, <code>Require all denied</code>, <code>.htaccess</code> cũ từ repo, geo/IP allowlist chưa thêm IP egress mới.</p><p>4. <strong>Lớp CDN/WAF/cache chặn</strong> — rule bot, reputation IP, stale 403 được cache lại sau lần deploy trước, proxy egress trả 403 thay cho origin.</p><p>5. <strong>Container/volume + SELinux/AppArmor</strong> — volume mount <code>:ro</code>, container chạy với <code>user:</code> không khớp uid host, hoặc label SELinux chưa sửa sau khi bind mount mới.</p><p>6. <strong>DNS trỏ nhầm host/default_server</strong> — trỏ tới IP cũ của service khác, SNI sai, virtual host mặc định trả 403 cho mọi domain chưa khai báo; DNS còn đang propagate làm tình huống khó tái hiện.</p><h2>Fix từng nguyên nhân</h2><p><strong>1. Sửa ownership/permission cho đúng user web server</strong></p><pre><code>sudo chown -R www-data:www-data /var/www/app
+sudo find /var/www/app -type d -exec chmod 755 {} \;
+sudo find /var/www/app -type f -exec chmod 644 {} \;
+sudo chmod -R ug+rwX /var/www/app/storage /var/www/app/bootstrap/cache
+sudo -u www-data test -r /var/www/app/public/index.php &amp;&amp; echo OK
+</code></pre><p>Nếu PHP-FPM chạy user khác nginx, đọc pool config và chỉnh cho khớp:</p><pre><code>grep -E &#x27;^(user|group|listen)&#x27; /etc/php/*/fpm/pool.d/www.conf
+sudo systemctl restart php-fpm nginx
+</code></pre><p>Có ACL thì <code>chmod</code> chưa đủ, hãy soi <code>getfacl -p /var/www/app/public/index.php</code> và sửa bằng <code>setfacl -m u:www-data:r-x</code>.</p><p><strong>2. Kiểm tra document root, index và symlink release</strong></p><pre><code>ls -ld /var/www/app/current /var/www/app/current/public
+sudo nginx -T | grep -nE &#x27;root|index|try_files|autoindex&#x27;
+</code></pre><p>Config nginx chuẩn cho app PHP:</p><pre><code>server {
+    listen 80;
+    server_name example.com;
+    root /var/www/app/current/public;
+    index index.php;
+
+    location / {
+        try_files $uri $uri/ /index.php?$query_string;
+    }
+
+    location ~ \.php$ {
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:/run/php/php-fpm.sock;
+    }
+}
+</code></pre><p>Apache thì kiểm tra <code>DirectoryIndex index.php</code> và <code>AllowOverride</code> trong <code>&lt;Directory&gt;</code>. Đừng bật <code>autoindex on</code> chỉ để &quot;cho nó hiện danh sách&quot; — đó là cách vá triệu chứng, để lộ cấu trúc project.</p><p><strong>3. Tìm rule deny đang áp dụng</strong></p><pre><code>sudo nginx -T | grep -nEi &#x27;deny|allow|satisfy|auth_basic&#x27;
+grep -RniE &#x27;deny from|require all denied|order allow,deny&#x27; /var/www/app/current/public/.htaccess
+sudo apachectl -S
+</code></pre><p>Sau khi sửa, reload và test từ chính IP bị chặn. Với allowlist, nhớ thêm cả IP của reverse proxy/load balancer, không chỉ IP người dùng cuối.</p><p><strong>4. Tách lớp CDN/WAF ra khỏi origin</strong></p><pre><code>curl -sSI https://example.com | grep -iE &#x27;server|cf-cache-status|x-cache|via&#x27;
+curl -sSI --resolve example.com:443:ORIGIN_IP https://example.com
+curl -sSI -H &#x27;Cache-Control: no-cache&#x27; &#x27;https://example.com/?cb=debug&#x27;
+</code></pre><p>Nếu origin trả 200 mà edge trả 403, purging cache và review rule WAF là hướng đúng. Nếu <code>Via:</code> cho thấy đi qua proxy công ty, thử <code>curl --noproxy &#x27;*&#x27; -I ...</code> để loại trừ egress.</p><p><strong>5. Container, volume và SELinux</strong></p><pre><code>services:
+  app:
+    image: myapp:latest
+    user: &quot;www-data:www-data&quot;
+    volumes:
+      - ./public:/var/www/app/public:z
+</code></pre><pre><code>docker inspect app --format &#x27;{{json .Mounts}}&#x27;
+ls -Z /var/www/app/public/index.php
+sudo ausearch -m avc -ts recent | tail -n 20
+</code></pre><p><code>:z</code>/<code>:Z</code> sửa label SELinux cho bind mount; nếu log AVC hiện <code>avc: denied { read }</code>, đó là nguyên nhân, không phải quyền Unix.</p><p><strong>6. DNS, SNI và default_server</strong></p><pre><code>dig +short example.com A
+dig +trace example.com A
+curl -sSI --connect-to example.com:443:NEW_IP:443 https://example.com
+sudo nginx -T | grep -n &#x27;default_server&#x27;
+</code></pre><p>Đảm bảo block <code>server_name example.com;</code> tồn tại trên host mới. Nếu chỉ block <code>default_server</code> trả 403, mọi domain trỏ nhầm vào IP đó sẽ cùng lỗi.</p><h2>Edge cases cần soi sâu hơn</h2><li>**Proxy env không như bạn nghĩ:** `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` trong shell/CI có thể khiến `curl` và cả health-check đi qua egress proxy, nên 403 phát ra từ proxy chứ không phải hosting. So sánh `env | grep -i proxy`, log `curl -v`, và header `Via`/`X-Forwarded-For`. Đừng kết luận origin hỏng khi chưa test bằng `--noproxy &#x27;*&#x27;` hoặc từ một mạng khác.</li><li>**Nhiều venv/runtime cùng tồn tại:** deploy bằng `pip install` vào venv A nhưng systemd chạy `ExecStart` trỏ tới venv B; app vẫn load được nhưng middleware auth trả 403 vì config/env khác nhau. Kiểm tra `which gunicorn`, `python -c &quot;import sys; print(sys.prefix)&quot;`, và `systemctl show -p Environment app.service` trước khi đổ lỗi cho filesystem.</li><li>**DNS propagation + cache chồng lên cache:** resolver local còn giữ IP cũ, CDN edge khu vực cũ đã cache 403, trong khi origin đã đúng. Lấy IP từ authoritative NS (`dig @NS...`), so sánh TTL, test qua `dig +trace` và `curl --resolve`, rồi mới purge từng lớp theo thứ tự origin → edge → resolver.</li><p>Ở ba tình huống này, AI agent có thể tự debug từng bước: đọc error log, đối chiếu config nginx/systemd, chạy <code>curl</code> có kiểm soát, so sánh response origin/edge, rồi đề xuất patch cụ thể thay vì đoán — bạn chỉ cần cung cấp quyền đọc log và môi trường deploy.</p><h2>FAQ schema — 3 câu hỏi</h2><p><strong>403 sau deploy khác gì 404?</strong>  </p><p>404 là không tìm thấy resource; 403 là resource có thể tồn tại nhưng server từ chối truy cập. Sau deploy, 403 thường do quyền, deny rule hoặc document root sai.</p><p><strong>Có phải lúc nào cũng do <code>chmod 777</code> chưa đúng không?</strong>  </p><p>Không. <code>777</code> che giấu sai ownership và vẫn bị SELinux/ACL chặn. Hãy dùng <code>755</code> cho thư mục, <code>644</code> cho file và chỉ mở ghi cho thư mục cần thiết như <code>storage/</code>.</p><p><strong>Bao lâu thì hết 403 sau khi sửa DNS?</strong>  </p><p>Tùy TTL. Origin có thể đúng ngay, nhưng resolver và CDN edge giữ bản cũ tới khi hết TTL hoặc bạn purge chủ động.</p><pre><code>{
+  &quot;@context&quot;: &quot;https://schema.org&quot;,
+  &quot;@type&quot;: &quot;FAQPage&quot;,
+  &quot;mainEntity&quot;: [
+    {
+      &quot;@type&quot;: &quot;Question&quot;,
+      &quot;name&quot;: &quot;403 sau deploy khác gì 404?&quot;,
+      &quot;acceptedAnswer&quot;: {
+        &quot;@type&quot;: &quot;Answer&quot;,
+        &quot;text&quot;: &quot;404 là không tìm thấy resource; 403 là server từ chối authorize. Sau deploy, 403 thường do quyền filesystem, deny rule hoặc document root sai.&quot;
+      }
+    },
+    {
+      &quot;@type&quot;: &quot;Question&quot;,
+      &quot;name&quot;: &quot;Có phải lúc nào cũng do chmod chưa đúng không?&quot;,
+      &quot;acceptedAnswer&quot;: {
+        &quot;@type&quot;: &quot;Answer&quot;,
+        &quot;text&quot;: &quot;Không. Dùng 755 cho thư mục và 644 cho file là đủ trong đa số trường hợp; SELinux, ACL và ownership sai vẫn gây 403 dù đã chmod.&quot;
+      }
+    },
+    {
+      &quot;@type&quot;: &quot;Question&quot;,
+      &quot;name&quot;: &quot;Bao lâu thì hết 403 sau khi sửa DNS?&quot;,
+      &quot;acceptedAnswer&quot;: {
+        &quot;@type&quot;: &quot;Answer&quot;,
+        &quot;text&quot;: &quot;Tùy TTL. Origin có thể đúng ngay nhưng resolver và CDN edge giữ bản cũ tới khi hết TTL hoặc được purge.&quot;
+      }
+    }
+  ]
+}
+</code></pre><p>Nếu edge case của bạn vẫn kẹt sau các bước trên, có thể dùng agent debug tự động để lần theo log, cấu hình và response header từng lớp: https://docs.claude.com/en/docs/claude-code/overview</p><p>---</p><p>*Tự debug với AI agent: [Python Fix Guides — agent giải lỗi kèm checklist tự kiểm](https://chillguys169800-ai.github.io/)*</p><p class="back"><a href="/index.html">← Back to all guides</a></p></body></html>

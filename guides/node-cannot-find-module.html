@@ -1,0 +1,49 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Node Cannot Find Module</title>
+<style>body{font-family:system-ui;max-width:760px;margin:40px auto;padding:0 20px;line-height:1.65}
+h1{font-size:1.5em}h2{font-size:1.2em;margin-top:1.8em}
+pre{background:#f4f4f4;padding:14px;border-radius:8px;overflow-x:auto}
+code{background:#eee;padding:2px 6px;border-radius:4px}
+blockquote{border-left:3px solid #0a7f2e;margin:0;padding-left:14px;color:#333}
+a{color:#0a7f2e}.back{margin-top:2em}</style></head><body>
+<h1>Error: Node.js &#x27;Cannot find module&#x27; after npm install</h1><h2>TL;DR — fix nhanh</h2><pre><code>rm -rf node_modules package-lock.json
+npm install
+</code></pre><p>Nếu vẫn lỗi, kiểm tra bạn có đang chạy script từ đúng thư mục chứa <code>node_modules</code> không, và đảm bảo <code>require(&#x27;...&#x27;)</code> trỏ đúng tên package đã khai báo trong <code>package.json</code>.</p><p>---</p><h2>Nguyên nhân thật sự</h2><p><code>Cannot find module &#x27;x&#x27;</code> nghĩa là Node đi qua toàn bộ thuật toán resolution (<code>require.resolve</code>) và không tìm thấy file nào khớp. Điểm quan trọng: <strong>lỗi này không nằm ở npm install, mà ở bước resolve của Node.</strong> <code>npm install</code> có thể đã chạy thành công, exit code 0, nhưng module vẫn &quot;tàng hình&quot; với process đang chạy vì một trong các lý do bên dưới.</p><p>Node resolve theo thứ tự: (1) core module, (2) <code>node_modules</code> leo ngược từ thư mục file hiện tại lên root, (3) <code>NODE_PATH</code>, (4) global folders. Chỉ cần lệch một mắt xích trong chuỗi đó là lỗi. Và vì resolution phụ thuộc vào <strong>vị trí file gọi <code>require</code></strong>, chứ không phải cwd, nên hai script trong cùng project vẫn có thể hành xử khác nhau.</p><h2>6 nguyên nhân phổ biến (xếp theo xác suất gặp)</h2><p>1. <strong>Chạy script sai thư mục / sai entry</strong> — <code>node dist/index.js</code> trong khi <code>node_modules</code> nằm ở project root, hoặc monorepo cài ở root nhưng chạy ở package con.</p><p>2. <strong><code>node_modules</code> hỏng hoặc cài thiếu</strong> — install bị ngắt, disk full, hoặc <code>package-lock.json</code> lệch với <code>package.json</code>.</p><p>3. <strong>Package là devDependency nhưng chạy với <code>NODE_ENV=production</code></strong> — <code>npm install --production</code> bỏ qua dev deps.</p><p>4. <strong>Sai tên hoặc sai subpath export</strong> — <code>require(&#x27;lodash/fp&#x27;)</code> khi package dùng <code>exports</code> field chặn subpath, hoặc typo tên.</p><p>5. <strong>Nhiều <code>node_modules</code> / nhiều phiên bản Node</strong> — nvm đổi version, global module không thấy được từ local.</p><p>6. <strong>Symlink / workspace</strong> — <code>npm link</code>, yarn workspaces, pnpm: module nằm ở <code>.pnpm</code> store, resolve qua symlink bị gãy.</p><h2>Fix từng nguyên nhân</h2><p>### 1. Chạy sai thư mục</p><p>Luôn chạy script bằng relative path từ root, hoặc dùng npm script để Node tự set cwd:</p><pre><code>// package.json
+{
+  &quot;scripts&quot;: {
+    &quot;start&quot;: &quot;node src/index.js&quot;
+  }
+}
+</code></pre><pre><code>npm start   # thay vì node src/index.js từ thư mục khác
+</code></pre><p>Kiểm tra Node đang resolve từ đâu:</p><pre><code>node -e &quot;console.log(require.resolve.paths(&#x27;express&#x27;))&quot;
+</code></pre><p>### 2. node_modules hỏng — cài lại sạch</p><pre><code>rm -rf node_modules package-lock.json
+npm cache verify
+npm install
+</code></pre><p>Nếu dùng npm &gt;= 7 và vẫn lỗi, thử <code>npm ci</code> để cài đúng theo lock:</p><pre><code>npm ci
+</code></pre><p>### 3. NODE_ENV=production nuốt devDependencies</p><pre><code># xem env hiện tại
+echo $NODE_ENV
+
+# cài đủ cả dev deps
+NODE_ENV=development npm install
+</code></pre><p>Hoặc cài trực tiếp package đang thiếu:</p><pre><code>npm install --save-dev typescript ts-node
+</code></pre><p>### 4. Sai subpath / package dùng exports field</p><p>Kiểm tra package có export đúng đường dẫn bạn require không:</p><pre><code>node -e &quot;console.log(require.resolve(&#x27;lodash/fp&#x27;))&quot;
+cat node_modules/lodash/package.json | grep -A5 &#x27;&quot;exports&quot;&#x27;
+</code></pre><p>Nếu package chặn subpath, dùng entry chính:</p><pre><code>// sai nếu exports chặn subpath
+const fp = require(&#x27;lodash/fp&#x27;);
+
+// đúng — dùng import chính
+const _ = require(&#x27;lodash&#x27;);
+</code></pre><p>### 5. Nhiều node_modules / đổi Node version</p><pre><code>node -v                 # version đang chạy
+which node              # binary nào
+npm root -g             # global modules ở đâu
+nvm current             # nếu dùng nvm
+</code></pre><p>Cài lại native/hoặc cài package vào đúng version:</p><pre><code>nvm use 20
+npm rebuild
+</code></pre><p>### 6. Symlink / workspace gãy</p><pre><code># với npm workspaces
+npm install --workspaces --include-workspace-root
+
+# kiểm tra symlink
+ls -la node_modules/your-package
+</code></pre><p>Với pnpm, đừng trộn <code>npm install</code> — dùng đúng package manager của repo:</p><pre><code>pnpm install
+</code></pre><h2>Edge cases cần soi sâu hơn</h2><p>Ba tình huống dưới đây thường không giải quyết được bằng fix nhanh, vì chúng phụ thuộc môi trường chứ không phải code:</p><li>**Proxy / registry env**: `HTTP_PROXY`, `HTTPS_PROXY`, `npm config get registry` trỏ sai khiến install &quot;thành công giả&quot; (tải từ cache rỗng). Cần soi `~/.npmrc`, `.npmrc` trong project, và log `npm install --verbose`.</li><li>**Multiple venvs / multiple Node versions song song**: nvm + volta + system node chồng nhau, mỗi shell một version, module cài ở version này không thấy ở version kia. Cần soi `PATH` order và shell rc.</li><li>**DNS propagation / registry 私 mirror**: custom registry chưa sync package mới, hoặc DNS trỏ tới mirror cũ. Cần so `npm view &lt;pkg&gt; versions` với registry công khai.</li><p>Nếu bạn kẹt ở một trong ba edge case này, một AI agent có thể tự chạy từng bước debug giúp bạn: đọc <code>NODE_PATH</code>, so sánh <code>require.resolve.paths</code>, kiểm tra symlink, và thử install trong sandbox sạch để cô lập nguyên nhân — thay vì bạn phải đoán.</p><h2>FAQ</h2><p><strong>Tại sao <code>npm install</code> báo thành công mà Node vẫn báo Cannot find module?</strong></p><p>Vì <code>npm install</code> chỉ đảm bảo file nằm trong <code>node_modules</code>; còn Node resolve dựa trên vị trí file gọi <code>require</code> và <code>NODE_PATH</code>. Hai thứ này lệch nhau thì vẫn lỗi dù install exit code 0.</p><p><strong>Xóa <code>node_modules</code> rồi cài lại có mất gì không?</strong></p><p>Không, <code>node_modules</code> tái tạo được từ <code>package.json</code> + lock file. Đây là cách reset an toàn và nhanh nhất cho 80% trường hợp.</p><p><strong>Sửa <code>NODE_PATH</code> có phải cách đúng không?</strong></p><p>Không nên xem là fix chính. <code>NODE_PATH</code> chỉ che giấu vấn đề resolve sai thư mục. Fix đúng là chạy script từ đúng entry hoặc dùng npm script.</p><p>---</p><p>*Tự debug với AI agent: [Python Fix Guides — agent giải lỗi kèm checklist tự kiểm](https://chillguys169800-ai.github.io/)*</p><p class="back"><a href="/index.html">← Back to all guides</a></p></body></html>

@@ -1,0 +1,81 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Python Module Not Found</title>
+<style>body{font-family:system-ui;max-width:760px;margin:40px auto;padding:0 20px;line-height:1.65}
+h1{font-size:1.5em}h2{font-size:1.2em;margin-top:1.8em}
+pre{background:#f4f4f4;padding:14px;border-radius:8px;overflow-x:auto}
+code{background:#eee;padding:2px 6px;border-radius:4px}
+blockquote{border-left:3px solid #0a7f2e;margin:0;padding-left:14px;color:#333}
+a{color:#0a7f2e}.back{margin-top:2em}</style></head><body>
+<h1>Error: ModuleNotFoundError: No module named &#x27;xyz&#x27; in Python</h1><h2>TL;DR — fix nhanh</h2><pre><code>python -m pip install xyz
+python -c &quot;import sys; print(sys.executable)&quot;
+python -c &quot;import xyz; print(xyz.__file__)&quot;
+</code></pre><p>Ba dòng trên giải quyết đa số trường hợp: cài bằng đúng interpreter đang chạy, xác nhận interpreter đó là interpreter bạn nghĩ, rồi xác nhận file module được nạp từ đâu. Nếu dòng cuối vẫn in ra đường dẫn khác với dự kiến, đọc tiếp phần nguyên nhân.</p><h2>Nguyên nhân thật: import không phải là &quot;tìm file&quot;, mà là &quot;hỏi interpreter đang chạy&quot;</h2><p>Khi Python gặp <code>import xyz</code>, nó không tìm kiếm toàn bộ ổ cứng. Trình import đi theo một chuỗi finder trong <code>sys.meta_path</code>, hỏi lần lượt: module built-in có không, module frozen có không, rồi có file/thư mục nào khớp trong từng entry của <code>sys.path</code> không. <code>ModuleNotFoundError</code> được raise khi <strong>không có spec nào cho tên top-level <code>xyz</code></strong> trong suốt chuỗi đó. Nó là subclass của <code>ImportError</code>, nhưng khác biệt quan trọng: <code>ImportError</code> thường nghĩa là module đã tìm thấy nhưng bị lỗi bên trong (thuộc tính/submodule không tồn tại, circular import), còn <code>ModuleNotFoundError</code> nghĩa là <strong>chưa tìm thấy module để mà import</strong>.</p><p>Điểm hay bị hiểu nhầm nằm ở chỗ <code>sys.path</code> được xây dựng *cho interpreter cụ thể đang chạy*: nó chứa thư mục script, <code>PYTHONPATH</code>, stdlib, và <code>site-packages</code> của chính interpreter đó. <code>pip</code> cũng là một module của một interpreter: lệnh <code>pip install xyz</code> không cài &quot;cho máy&quot;, nó cài cho <code>sys.prefix</code> của Python chạy lệnh đó. Vì vậy &quot;máy tôi đã cài rồi mà vẫn báo lỗi&quot; gần như luôn là hai interpreter khác nhau, chứ không phải Python lỗi.</p><p>Một tầng nữa: tên cài trên PyPI không đồng nhất với tên import. <code>xyz</code> trong thông báo lỗi có thể là placeholder trong tài liệu, nhưng nguyên tắc vẫn áp dụng cho tên thật — <code>beautifulsoup4</code> cho ra <code>bs4</code>, <code>Pillow</code> cho ra <code>PIL</code>, <code>PyYAML</code> cho ra <code>yaml</code>. Cài đúng package mà import sai tên vẫn ra đúng error này.</p><h2>6 nguyên nhân phổ biến, xếp theo xác suất gặp</h2><p>1. <strong>pip và python không cùng một interpreter</strong> — phổ biến nhất, đặc biệt khi máy có <code>python</code>, <code>python3</code>, conda, venv lồng nhau.</p><p>2. <strong>Nhầm tên package với tên import</strong> — cài <code>Pillow</code> rồi <code>import Pillow</code>, cài <code>python-dateutil</code> rồi <code>import python-dateutil</code>.</p><p>3. <strong>Module local nằm ngoài <code>sys.path</code></strong> — chạy <code>python path/to/script.py</code> từ thư mục khác, project dùng layout <code>src/</code> mà chưa cài editable.</p><p>4. <strong>Jupyter kernel hoặc IDE dùng interpreter khác terminal</strong> — terminal cài xong nhưng kernel notebook vẫn trỏ sang base env.</p><p>5. <strong>Dependency thiếu trong manifest</strong> — chạy được ở local nhờ cài tay, nhưng CI/production chỉ đọc <code>requirements.txt</code> hoặc <code>pyproject.toml</code>.</p><p>6. <strong>Editable install / namespace package / phân biệt hoa thường</strong> — thư mục đổi tên, <code>.egg-info</code> cũ, thư mục rỗng cùng tên che namespace, hoặc <code>Xyz</code> trên macOS nhưng <code>xyz</code> trên Linux.</p><h2>Fix từng nguyên nhân</h2><p>### 1.pip và python không cùng interpreter</p><pre><code>which -a python python3 pip pip3
+python -c &quot;import sys; print(sys.executable); print(*sys.path, sep=&#x27;\n&#x27;)&quot;
+python -m pip --version
+python -m pip install xyz
+python -c &quot;import xyz; print(xyz.__file__)&quot;
+</code></pre><p>Quy tắc cốt lõi: <strong>luôn dùng <code>python -m pip</code></strong>, không gọi <code>pip</code> trực tiếp. Nếu chưa có venv, tạo lại từ đầu cho sạch:</p><pre><code>python3 -m venv .venv
+source .venv/bin/activate          # Windows PowerShell: .venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install xyz
+python -c &quot;import sys, xyz; print(sys.executable); print(xyz.__file__)&quot;
+</code></pre><p>### 2.Tên cài khác tên import</p><p>| Lệnh cài | Câu import đúng |</p><p>| --- | --- |</p><p>| <code>beautifulsoup4</code> | <code>import bs4</code> |</p><p>| <code>Pillow</code> | <code>import PIL</code> |</p><p>| <code>PyYAML</code> | <code>import yaml</code> |</p><p>| <code>python-dateutil</code> | <code>import dateutil</code> |</p><p>| <code>scikit-learn</code> | <code>import sklearn</code> |</p><p>| <code>opencv-python</code> | <code>import cv2</code> |</p><pre><code>python -m pip show beautifulsoup4
+python - &lt;&lt;&#x27;PY&#x27;
+import importlib.util
+for name in (&quot;bs4&quot;, &quot;PIL&quot;, &quot;yaml&quot;, &quot;dateutil&quot;, &quot;sklearn&quot;, &quot;cv2&quot;):
+    print(name, &quot;-&gt;&quot;, bool(importlib.util.find_spec(name)))
+PY
+</code></pre><p><code>find_spec()</code> trả về <code>None</code> chính là lỗi này dưới dạng kiểm tra được. Với <code>xyz</code> là nội bộ, thay tên thật vào và kiểm tra phần <code>Name:</code> trong <code>pip show</code>.</p><p>### 3.Module local không nằm trên <code>sys.path</code></p><pre><code>find . -type d -name xyz -o -type f -name &#x27;xyz.py&#x27;
+export PYTHONPATH=&quot;$(pwd)/src:${PYTHONPATH}&quot;
+python -m mypackage.main
+python -c &quot;import sys; print(sys.path[0])&quot;
+</code></pre><p>Chạy <code>python -m mypackage.main</code> sẽ đưa thư mục hiện tại vào <code>sys.path[0]</code>; chạy <code>python src/mypackage/main.py</code> thì <code>sys.path[0]</code> là thư mục chứa file script, không phải gốc repo — đó là lý do import tầng trên cùng hỏng. Cách bền hơn là khai báo project trong <code>pyproject.toml</code> rồi cài editable (xem mục 5). Trên Windows, thay <code>export</code> bằng <code>$env:PYTHONPATH = &quot;$PWD\src;$env:PYTHONPATH&quot;</code>.</p><p>### 4.Kernel Jupyter / IDE dùng interpreter khác</p><pre><code>python -m pip install ipykernel
+python -m ipykernel install --user --name project-xyz --display-name &quot;Python (project-xyz)&quot;
+</code></pre><p>Trong notebook, chọn kernel <code>Python (project-xyz)</code> từ menu, rồi verify:</p><pre><code>import sys
+print(sys.executable)
+print(sys.path)
+</code></pre><pre><code>%pip install xyz
+</code></pre><p>Magic <code>%pip</code> cài vào đúng interpreter của kernel hiện tại, khác với <code>!pip install</code> vẫn đi theo <code>PATH</code> của shell. Trong VS Code/PyCharm, đối chiếu đường dẫn interpreter hiển thị ở thanh trạng thái với kết quả <code>python -c &quot;import sys; print(sys.executable)&quot;</code> trong terminal.</p><p>### 5.Thiếu dependency trong manifest</p><pre><code># pyproject.toml
+[project]
+dependencies = [&quot;xyz&gt;=1,&lt;2&quot;]
+</code></pre><pre><code># requirements.txt
+xyz&gt;=1,&lt;2
+</code></pre><pre><code>python -m pip install -e &quot;.[dev]&quot;
+python -m pip install -r requirements.txt
+python -m pip check
+</code></pre><p><code>pip check</code> bắt phần dependency của dependency bị thiếu — trường hợp bạn cài <code>xyz</code> nhưng một subpackage của nó không được kéo theo.</p><p>### 6.Editable install, namespace package, case-sensitivity</p><pre><code>python -m pip show -f xyz
+python -c &quot;import importlib.util; print(importlib.util.find_spec(&#x27;xyz&#x27;))&quot;
+find . -type d \( -name &#x27;*.egg-info&#x27; -o -name &#x27;xyz&#x27; \) -print
+python -m pip install --force-reinstall --no-cache-dir -e .
+</code></pre><p>Một thư mục tên <code>xyz</code> nhưng không có <code>__init__.py</code> có thể trở thành namespace package rỗng và làm lu mờ package thật cài trong site-packages. Tương tự, <code>.pth</code>/<code>.egg-info</code> còn sót sau khi đổi tên thư mục project sẽ trỏ vào đường dẫn cũ. Trên Linux, <code>import Xyz</code> không bao giờ khớp file <code>xyz.py</code>; trên macOS thì có thể khớp — nên lỗi chỉ xuất hiện khi lên CI.</p><h2>Edge cases cần soi sâu hơn</h2><li>**Proxy và biến môi trường của pip**: `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, `PIP_INDEX_URL`, `PIP_TRUSTED_HOST`, `REQUESTS_CA_BUNDLE`. Cài qua mirror nội bộ có thể &quot;thành công&quot; nhưng trả về artifact cũ hoặc sai tên, rồi mới báo `ModuleNotFoundError` lúc runtime. Soi bằng `python -m pip config list -v` và `python -m pip install -vvv xyz`.</li><li>**Nhiều venv xếp chồng**: conda base + venv + direnv + Poetry `virtualenvs.in-project` + uv có thể cùng active. Đối chiếu `echo $VIRTUAL_ENV`, `echo $CONDA_PREFIX`, `which python` và `python -c &quot;import sys; print(sys.prefix, sys.base_prefix)&quot;`; đừng tin vào dấu nhắc shell.</li><li>**DNS propagation / private index vừa đổi domain**: sau khi đổi mirror nội bộ, resolver hoặc cache DNS còn trỏ bản cũ. Kiểm tra `getent hosts &lt;index-host&gt;`, thử `python -m pip install --no-cache-dir xyz`, rồi so sánh kết quả từ mạng khác.</li><p>Với ba tình huống này, AI agent có thể tự debug từng bước nếu cần: lần lượt chạy lệnh chẩn đoán, đọc output, so sánh <code>sys.executable</code> với <code>pip --version</code>, thu hẹp dần từ môi trường xuống từng dòng cấu hình thay vì đoán.</p><h2>FAQ — schema JSON-LD</h2><pre><code>{
+  &quot;@context&quot;: &quot;https://schema.org&quot;,
+  &quot;@type&quot;: &quot;FAQPage&quot;,
+  &quot;mainEntity&quot;: [
+    {
+      &quot;@type&quot;: &quot;Question&quot;,
+      &quot;name&quot;: &quot;ModuleNotFoundError khác ImportError thế nào?&quot;,
+      &quot;acceptedAnswer&quot;: {
+        &quot;@type&quot;: &quot;Answer&quot;,
+        &quot;text&quot;: &quot;ModuleNotFoundError nghĩa là trình import không tìm thấy spec cho tên module đó trong sys.meta_path và sys.path. ImportError thường nghĩa là module đã tìm thấy nhưng nội dung bên trong lỗi, ví dụ attribute không tồn tại hoặc import vòng.&quot;
+      }
+    },
+    {
+      &quot;@type&quot;: &quot;Question&quot;,
+      &quot;name&quot;: &quot;Tại sao đã pip install xyz mà vẫn báo No module named &#x27;xyz&#x27;?&quot;,
+      &quot;acceptedAnswer&quot;: {
+        &quot;@type&quot;: &quot;Answer&quot;,
+        &quot;text&quot;: &quot;Vì pip có thể thuộc interpreter khác với interpreter đang chạy script. Hãy dùng python -m pip install xyz rồi kiểm tra bằng python -c \&quot;import sys; print(sys.executable)\&quot; và python -c \&quot;import xyz; print(xyz.__file__)\&quot;.&quot;
+      }
+    },
+    {
+      &quot;@type&quot;: &quot;Question&quot;,
+      &quot;name&quot;: &quot;Có nên thêm sys.path.insert vào code để sửa lỗi này không?&quot;,
+      &quot;acceptedAnswer&quot;: {
+        &quot;@type&quot;: &quot;Answer&quot;,
+        &quot;text&quot;: &quot;Chỉ nên dùng như biện pháp tạm thời. Cách bền là cài project ở chế độ editable với python -m pip install -e . hoặc khai báo dependency trong pyproject.toml, để môi trường nào cũng dựng lại được cùng một sys.path.&quot;
+      }
+    }
+  ]
+}
+</code></pre><p>Nếu edge case của bạn vẫn kẹt sau khi đã đối chiếu interpreter, kernel và proxy, có thể để agent debug tự động từng bước thay vì lần mò thủ công: [Claude Code](https://claude.com/claude-code).</p><p>---</p><p>*Tự debug với AI agent: [Python Fix Guides — agent giải lỗi kèm checklist tự kiểm](https://chillguys169800-ai.github.io/)*</p><p class="back"><a href="/index.html">← Back to all guides</a></p></body></html>

@@ -1,0 +1,62 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Mysql Too Many Connections</title>
+<style>body{font-family:system-ui;max-width:760px;margin:40px auto;padding:0 20px;line-height:1.65}
+h1{font-size:1.5em}h2{font-size:1.2em;margin-top:1.8em}
+pre{background:#f4f4f4;padding:14px;border-radius:8px;overflow-x:auto}
+code{background:#eee;padding:2px 6px;border-radius:4px}
+blockquote{border-left:3px solid #0a7f2e;margin:0;padding-left:14px;color:#333}
+a{color:#0a7f2e}.back{margin-top:2em}</style></head><body>
+<h1>Error: MySQL &#x27;Too many connections&#x27; error on small site</h1><h2>TL;DR — fix nhanh</h2><pre><code>// 1. Đóng kết nối ngay sau khi dùng (persistent = false)
+$pdo = new PDO($dsn, $user, $pass, [PDO::ATTR_PERSISTENT =&gt; false]);
+
+// 2. Bật connection pooling ở tầng app thay vì mở mới mỗi request
+$pool-&gt;get(); // reuse thay vì new
+
+// 3. Nâng giới hạn tạm thời để xác nhận đúng bệnh
+mysql&gt; SET GLOBAL max_connections = 200;
+</code></pre><h2>Nguyên nhân thật</h2><p>Lỗi <code>Too many connections</code> nghĩa là số kết nối MySQL đang mở đã chạm <code>max_connections</code>. MySQL từ chối kết nối mới ngay ở bước handshake, nên app trả về 500 chứ không phải vì query chậm.</p><p>Điểm gây hiểu nhầm: &quot;site nhỏ&quot; không liên quan. Vấn đề không phải lượng traffic, mà là <strong>tỷ lệ mở/đóng kết nối</strong>. Một site 50 visit/ngày vẫn có thể treo nếu mỗi request mở 3-4 kết nối và không bao giờ đóng. Kết nối MySQL là tài nguyên server-side, giữ mở thì tốn RAM và slot. Khi slot đầy, mọi request kế tiếp chết — kể cả của bạn.</p><p>Nói ngắn: đây là lỗi quản lý vòng đời kết nối, không phải lỗi tải.</p><h2>4 nguyên nhân phổ biến (xếp theo xác suất gặp)</h2><p>1. <strong>Persistent connection bật</strong> (<code>pconnect</code> / <code>ATTR_PERSISTENT =&gt; true</code>) — dưới PHP-FPM, mỗi worker giữ một kết nối sống mãi, nhân với số worker là đầy slot.</p><p>2. <strong>Connection leak</strong> — mở trong hàm, throw exception giữa chừng, không đóng trong <code>finally</code>.</p><p>3. <strong><code>max_connections</code> đặt quá thấp</strong> so với <code>pm.max_children</code> của PHP-FPM.</p><p>4. <strong>Nhiều app/venv dùng chung một MySQL</strong> mà không ai biết, cộng dồn vượt hạn mức.</p><p>5. <strong>Worker/cron chạy song song</strong> mở kết nối riêng, không dùng chung pool.</p><h2>Fix từng nguyên nhân</h2><p>### 1. Tắt persistent connection</p><pre><code>// SAI — mỗi FPM worker giữ kết nối vĩnh viễn
+$pdo = new PDO($dsn, $user, $pass, [
+    PDO::ATTR_PERSISTENT =&gt; true,
+]);
+
+// ĐÚNG — đóng khi request kết thúc
+$pdo = new PDO($dsn, $user, $pass, [
+    PDO::ATTR_PERSISTENT =&gt; false,
+    PDO::ATTR_TIMEOUT     =&gt; 5,
+]);
+</code></pre><p>### 2. Chống leak bằng try/finally</p><pre><code>function getReport(PDO $pdo, int $id): array {
+    $stmt = $pdo-&gt;prepare(&quot;SELECT * FROM reports WHERE id = ?&quot;);
+    try {
+        $stmt-&gt;execute([$id]);
+        return $stmt-&gt;fetch(PDO::FETCH_ASSOC) ?: [];
+    } finally {
+        $stmt-&gt;closeCursor(); // giải phóng ngay, không đợi GC
+    }
+}
+</code></pre><p>### 3. Căn chỉnh <code>max_connections</code> với FPM</p><pre><code>; php-fpm pool (pm = dynamic)
+pm.max_children = 30
+
+; MySQL — phải &gt; max_children + headroom cho cron/admin
+max_connections = 100
+</code></pre><p>Công thức an toàn: <code>max_connections &gt;= pm.max_children + 20</code>. Nếu FPM cho 30 con chạy đồng thời mà MySQL chỉ cho 50, dư 20 còn lại dễ bị cron ăn hết.</p><p>### 4. Kiểm tra ai đang chiếm slot</p><pre><code>-- Ai đang giữ kết nối?
+SELECT user, host, COUNT(*) AS conns
+FROM information_schema.processlist
+GROUP BY user, host
+ORDER BY conns DESC;
+
+-- Đang bị sleep (chưa đóng) bao nhiêu?
+SHOW STATUS LIKE &#x27;Threads_connected&#x27;;
+SHOW VARIABLES LIKE &#x27;max_connections&#x27;;
+</code></pre><p>Nếu thấy nhiều <code>Sleep</code> từ cùng một user, gần như chắc chắn là leak hoặc persistent.</p><p>### 5. Dùng shared pool cho worker song song</p><pre><code># Thay vì mỗi task tạo engine mới
+from sqlalchemy.pool import QueuePool
+
+engine = create_engine(
+    DATABASE_URL,
+    poolclass=QueuePool,
+    pool_size=5,
+    max_overflow=10,
+    pool_pre_ping=True,   # tự loại kết nối đã chết
+    pool_recycle=1800,    # đóng trước khi MySQL cắt (wait_timeout)
+)
+</code></pre><h2>Nếu vẫn không hết: Edge cases cần soi sâu hơn</h2><li>**Proxy env (RDS Proxy / ProxySQL):** proxy giữ idle connection phía backend, `max_connections` thật nằm ở proxy chứ không phải MySQL. Bạn nâng `max_connections` trên DB nhưng vô ích vì proxy mới là nơi chặn. Cần soi config proxy riêng.</li><li>**Multiple venvs / nhiều version app:** hai môi trường (staging + prod) trỏ chung một DB qua `.env` khác nhau, mỗi cái mở pool riêng. Nhìn một phía tưởng ổn, cộng lại mới đầy. Phải map từng process về từng connection string.</li><li>**DNS propagation sau failover:** sau khi đổi host DB, kết nối cũ vẫn bám IP cũ do cache DNS/TTL, mở song song với IP mới → double số kết nối trong lúc propagate.</li><p>Ba tình huống này khó chẩn đoán bằng mắt vì triệu chứng giống hệt nhau. Nếu bạn đang kẹt ở đây, một AI agent có thể tự chạy từng bước debug giúp bạn: đọc <code>processlist</code>, đối chiếu config FPM/proxy, trace từng connection string về đúng nguồn.</p><h2>FAQ</h2><p><strong>Site nhỏ sao vẫn Too many connections?</strong></p><p>Vì lỗi phụ thuộc tỷ lệ mở/đóng kết nối, không phụ thuộc traffic. Persistent connection hoặc leak làm slot đầy dù lượng truy cập thấp.</p><p><strong>Nâng <code>max_connections</code> có phải fix triệt để không?</strong></p><p>Không. Nó chỉ trì hoãn. Nếu gốc là leak hoặc persistent, slot sẽ đầy lại. Phải sửa vòng đời kết nối.</p><p><strong>Làm sao biết là persistent hay leak?</strong></p><p>Chạy <code>SELECT * FROM information_schema.processlist</code>. Persistent hiện nhiều <code>Sleep</code> ổn định theo số worker; leak hiện số kết nối tăng dần theo thời gian.</p><p>---</p><p>Nếu edge case của bạn vẫn kẹt — proxy env, nhiều venv hay DNS sau failover — bạn có thể dùng agent debug tự động để nó soi từng bước thay vì đoán mò. [Dùng agent debug tại đây](#).</p><p>---</p><p>*Tự debug với AI agent: [Python Fix Guides — agent giải lỗi kèm checklist tự kiểm](https://chillguys169800-ai.github.io/)*</p><p class="back"><a href="/index.html">← Back to all guides</a></p></body></html>

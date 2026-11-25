@@ -1,0 +1,110 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Npm Eacces Permission</title>
+<style>body{font-family:system-ui;max-width:760px;margin:40px auto;padding:0 20px;line-height:1.65}
+h1{font-size:1.5em}h2{font-size:1.2em;margin-top:1.8em}
+pre{background:#f4f4f4;padding:14px;border-radius:8px;overflow-x:auto}
+code{background:#eee;padding:2px 6px;border-radius:4px}
+blockquote{border-left:3px solid #0a7f2e;margin:0;padding-left:14px;color:#333}
+a{color:#0a7f2e}.back{margin-top:2em}</style></head><body>
+<h1>Error: npm ERR! EACCES permission denied (global install)</h1><p><strong>TL;DR — fix nhanh</strong> (chạy bằng user thường, <strong>không</strong> dùng <code>sudo npm</code>):</p><pre><code>mkdir -p &quot;$HOME/.npm-global/bin&quot;
+npm config set prefix &quot;$HOME/.npm-global&quot;
+grep -q &#x27;.npm-global/bin&#x27; ~/.bashrc || echo &#x27;export PATH=&quot;$HOME/.npm-global/bin:$PATH&quot;&#x27; &gt;&gt; ~/.bashrc; source ~/.bashrc
+</code></pre><p>Dùng zsh thì thay <code>~/.bashrc</code> bằng <code>~/.zshrc</code>. Kiểm tra lại bằng <code>npm config get prefix</code> — phải trỏ về <code>$HOME/.npm-global</code>.</p><h2>Nguyên nhân thật: npm không được phép ghi vào prefix global</h2><p><code>npm install -g</code> không cài vào <code>node_modules</code> của project. Nó ghi vào <strong>prefix global</strong>: thường là <code>/usr/local</code> trên Linux/macOS khi Node được cài bằng apt/installer, hoặc một đường dẫn hệ thống do <code>.npmrc</code> chỉ định. User thường có quyền đọc thư mục đó nhưng <strong>không có quyền ghi</strong> vào <code>lib/node_modules</code>, <code>bin</code>, hoặc <code>~/.npm</code> (cache). Kernel trả <code>EACCES</code>, npm in ra dòng bạn thấy.</p><p>Hai điểm hay bị nhầm:</p><li>`EACCES` là lỗi **ghi file**, không phải lỗi mạng hay registry.</li><li>`command not found` sau khi cài là lỗi **PATH**, không phải EACCES. Sửa prefix xong mà vẫn không chạy được lệnh thì bạn đang dính thêm lỗi PATH.</li><p><code>sudo npm install -g</code> “chạy được” nhưng để lại file thuộc <code>root</code> trong <code>~/.npm</code>. Lần sau bạn chạy npm bằng user thường lại tiếp tục EACCES — vì vậy đây là cách chữa triệu chứng, không chữa nguyên nhân.</p><h2>6 nguyên nhân phổ biến, xếp theo xác suất gặp</h2><p>1. <strong>Prefix global trỏ tới thư mục hệ thống</strong> (<code>/usr/local</code>, <code>/usr</code>) do cài Node qua apt/official installer.</p><p>2. <strong><code>~/.npm</code> bị root chiếm quyền</strong> sau một lần từng chạy <code>sudo npm ...</code>.</p><p>3. <strong><code>.npmrc</code> ghi đè prefix</strong> ở user/project/global, trỏ sang thư mục read-only hoặc thuộc user khác.</p><p>4. <strong>Chạy trong Docker/CI với user không khớp owner của volume mount</strong>.</p><p>5. <strong>Filesystem đặc biệt</strong>: mount read-only, <code>chattr +i</code>, SELinux/AppArmor chặn ghi dù <code>ls -l</code> nhìn có vẻ ổn.</p><p>6. <strong>Nhiều runtime Node cùng lúc</strong> (nvm + apt + Corepack/Volta): shell này thấy prefix này, shell kia thấy prefix khác.</p><h2>Fix từng nguyên nhân</h2><p>### 1. Đổi prefix về thư mục của bạn</p><pre><code>PROFILE=&quot;$HOME/.bashrc&quot;; [ -n &quot;$ZSH_VERSION&quot; ] &amp;&amp; PROFILE=&quot;$HOME/.zshrc&quot;
+
+npm config get prefix
+mkdir -p &quot;$HOME/.npm-global/bin&quot; &quot;$HOME/.npm-global/lib/node_modules&quot;
+npm config set prefix &quot;$HOME/.npm-global&quot;
+grep -q &#x27;.npm-global/bin&#x27; &quot;$PROFILE&quot; || echo &#x27;export PATH=&quot;$HOME/.npm-global/bin:$PATH&quot;&#x27; &gt;&gt; &quot;$PROFILE&quot;
+source &quot;$PROFILE&quot;
+
+npm config get prefix
+npm install -g typescript
+</code></pre><p>### 2. Lấy lại quyền cache <code>~/.npm</code></p><pre><code>mkdir -p &quot;$HOME/.npm&quot; &quot;$HOME/.npm-global&quot;
+sudo chown -R &quot;$(id -u):$(id -g)&quot; &quot;$HOME/.npm&quot; &quot;$HOME/.npm-global&quot;
+npm cache verify
+npm install -g typescript
+</code></pre><p>Không cần <code>chmod 777</code>; chỉ cần owner đúng.</p><p>### 3. Dò và xóa override trong <code>.npmrc</code></p><pre><code>npm config list -l | grep -i prefix || true
+
+for f in &quot;$HOME/.npmrc&quot; &quot;$PWD/.npmrc&quot; &quot;$(npm root -g)/.npmrc&quot;; do
+  [ -f &quot;$f&quot; ] &amp;&amp; echo &quot;--- $f&quot; &amp;&amp; sed -n &#x27;1,80p&#x27; &quot;$f&quot;
+done
+
+npm config delete prefix --location=project 2&gt;/dev/null || true
+npm config set prefix &quot;$HOME/.npm-global&quot; --location=user
+npm config get prefix
+npm install -g typescript
+</code></pre><p>### 4. Docker/CI: map đúng uid:gid</p><pre><code>sudo chown -R &quot;$(id -u):$(id -g)&quot; . 2&gt;/dev/null || true
+
+docker run --rm -it \
+  -v &quot;$PWD:/workspace&quot; \
+  -u &quot;$(id -u):$(id -g)&quot; \
+  -w /workspace \
+  node:lts-alpine sh
+</code></pre><p>Trong container:</p><pre><code>mkdir -p /workspace/.npm-global/bin
+npm config set prefix /workspace/.npm-global
+export PATH=&quot;/workspace/.npm-global/bin:$PATH&quot;
+npm install -g typescript
+</code></pre><p>### 5. Soi filesystem/SELinux/AppArmor</p><pre><code>df -T &quot;$HOME&quot; &quot;$HOME/.npm-global&quot; 2&gt;/dev/null
+lsattr -d &quot;$HOME/.npm-global&quot; 2&gt;/dev/null || true
+sudo chattr -i &quot;$HOME/.npm-global&quot; 2&gt;/dev/null || true
+
+getenforce 2&gt;/dev/null || true
+sudo restorecon -Rv &quot;$HOME/.npm&quot; &quot;$HOME/.npm-global&quot; 2&gt;/dev/null || true
+sudo aa-status 2&gt;/dev/null | head -20 || true
+
+npm install -g typescript
+</code></pre><p>Nếu mount đang read-only, dời prefix sang path ghi được:</p><pre><code>P=&quot;${TMPDIR:-/tmp}/npm-global&quot;
+mkdir -p &quot;$P/bin&quot; &quot;$P/lib/node_modules&quot;
+npm config set prefix &quot;$P&quot;
+export PATH=&quot;$P/bin:$PATH&quot;
+npm install -g typescript
+</code></pre><p>### 6. Đồng nhất runtime khi có nvm/fnm/Volta</p><pre><code>which -a node npm
+echo &quot;$PATH&quot; | tr &#x27;:&#x27; &#x27;\n&#x27; | nl -ba
+
+npm config delete prefix --location=user 2&gt;/dev/null || true
+npm config delete prefix --location=project 2&gt;/dev/null || true
+
+if [ -s &quot;$HOME/.nvm/nvm.sh&quot; ]; then
+  . &quot;$HOME/.nvm/nvm.sh&quot;
+  nvm use --lts
+else
+  echo &quot;Không dùng nvm; quay lại fix 1 hoặc 4.&quot;
+fi
+
+command -v fnm &gt;/dev/null &amp;&amp; eval &quot;$(fnm env --use-on-cd)&quot; || true
+command -v volta &gt;/dev/null &amp;&amp; volta which node || true
+
+npm config get prefix
+npm install -g typescript
+</code></pre><h2>Edge cases cần soi sâu hơn</h2><p>1. <strong>Proxy env không khớp npm config.</strong> <code>HTTP_PROXY</code>, <code>HTTPS_PROXY</code>, <code>NO_PROXY</code> trong shell có thể khác <code>npm config get proxy</code>. Log thường trộn lỗi registry với lỗi cache write, dễ chẩn đoán nhầm thành EACCES. AI agent có thể tự so sánh <code>env | grep -i proxy</code> với <code>npm config list -l</code>, rồi chạy thử <code>npm view typescript version --loglevel=http</code> để tách riêng từng lớp.</p><p>2. <strong>Multiple venvs / multiple Node runtimes.</strong> Project dùng nvm, CI dùng apt Node, Corepack lại thêm một shim nữa — cùng một lệnh <code>npm i -g</code> chạy ở hai shell cho hai prefix khác nhau. Agent có thể tự đọc <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.npmrc</code>, <code>which -a npm</code>, <code>ls -ld &quot;$(npm config get prefix)&quot;</code> và sửa đúng file cấu hình đang được shell thực sự load.</p><p>3. <strong>DNS propagation / mirror nội bộ vừa đổi domain.</strong> DNS không trực tiếp gây EACCES, nhưng khi registry chuyển sang Artifactory/Nexus mới, cache metadata cũ còn trỏ tới path mirror read-only nên log hiện cả EACCES lẫn <code>EAI_AGAIN</code>. Agent có thể tự kiểm tra <code>npm config get registry</code>, <code>curl -I</code>, <code>dig</code>, làm sạch cache có chọn lọc rồi cài lại để xác nhận nguyên nhân.</p><p>Nếu bạn muốn agent tự lần ra prefix/cache/PATH thực tế trên máy của mình thay vì đoán thủ công, nói rõ shell + hệ điều hành + output <code>npm config list -l</code> là đủ để nó debug từng bước.</p><h2>FAQ schema</h2><pre><code>{
+  &quot;@context&quot;: &quot;https://schema.org&quot;,
+  &quot;@type&quot;: &quot;FAQPage&quot;,
+  &quot;mainEntity&quot;: [
+    {
+      &quot;@type&quot;: &quot;Question&quot;,
+      &quot;name&quot;: &quot;Vì sao không nên dùng sudo npm install -g để hết EACCES?&quot;,
+      &quot;acceptedAnswer&quot;: {
+        &quot;@type&quot;: &quot;Answer&quot;,
+        &quot;text&quot;: &quot;sudo cho phép ghi lần đó nhưng tạo file và cache thuộc root. Lần chạy npm tiếp theo bằng user thường sẽ lại bị EACCES. Cách đúng là đổi npm prefix sang thư mục thuộc về user hiện tại.&quot;
+      }
+    },
+    {
+      &quot;@type&quot;: &quot;Question&quot;,
+      &quot;name&quot;: &quot;Đổi prefix xong vẫn báo EACCES thì kiểm tra gì tiếp?&quot;,
+      &quot;acceptedAnswer&quot;: {
+        &quot;@type&quot;: &quot;Answer&quot;,
+        &quot;text&quot;: &quot;Kiểm tra ~/.npm có file thuộc root không, .npmrc có dòng prefix nào ghi đè không, và volume/container có đang mount read-only hoặc sai uid:gid không.&quot;
+      }
+    },
+    {
+      &quot;@type&quot;: &quot;Question&quot;,
+      &quot;name&quot;: &quot;EACCES khác gì với command not found sau khi cài global?&quot;,
+      &quot;acceptedAnswer&quot;: {
+        &quot;@type&quot;: &quot;Answer&quot;,
+        &quot;text&quot;: &quot;EACCES là lỗi quyền ghi trong lúc cài. command not found là lỗi PATH: package đã cài nhưng thư mục bin của prefix chưa nằm trong PATH của shell hiện tại.&quot;
+      }
+    }
+  ]
+}
+</code></pre><p>Nếu edge case của bạn vẫn kẹt sau các lệnh trên, có thể dùng agent debug tự động để lần ra prefix/cache/PATH thực tế từ log và shell của bạn: https://claude.com/claude-code</p><p>---</p><p>*Tự debug với AI agent: [Python Fix Guides — agent giải lỗi kèm checklist tự kiểm](https://chillguys169800-ai.github.io/)*</p><p class="back"><a href="/index.html">← Back to all guides</a></p></body></html>
